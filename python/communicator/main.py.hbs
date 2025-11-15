@@ -41,9 +41,14 @@ class Executor(AgentExecutor):
     ):
         user_message = request_context.user_message
         context_id = request_context.context_id
+        user_text = next(
+            (p["text"] for p in user_message["parts"] if p["kind"] == "text"), ""
+        )
+        print(f'[{context_id}] 📩 Message received: "{user_text}"')
 
         try:
             # 1. Find a chat agent in the registry
+            print(f"[{context_id}] 🔍 Searching for a 'chat' agent in the registry...")
             search_results = await registry.search("skill:chat")
             # Ensure we don't find and call ourselves in a loop
             chat_agent = next(
@@ -56,13 +61,17 @@ class Executor(AgentExecutor):
             )
 
             if not chat_agent:
+                print(f"[{context_id}] ❌ No other 'chat' agent found.")
                 raise Exception("No other 'chat' agent found in the local registry.")
+
+            print(f"[{context_id}] ✅ Found agent: \"{chat_agent['name']}\" at {chat_agent['url']}")
 
             # 2. Connect to the found agent
             card_url = f"{chat_agent['url']}/.well-known/agent-card.json"
             client = await A2AClient.from_card_url(card_url)
 
             # 3. Relay the user's message to the other agent
+            print(f"[{context_id}] 📲 Relaying message to \"{chat_agent['name']}\"...")
             send_params: MessageSendParams = {
                 "message": {
                     **user_message,
@@ -70,15 +79,18 @@ class Executor(AgentExecutor):
                 }
             }
             response = await client.send_message(send_params)
+            print(f"[{context_id}] 📩 Received response from \"{chat_agent['name']}\".")
 
             if "error" in response:
                 raise Exception(f"Error from relayed agent: {response['error']['message']}")
 
             # 4. Return the response from the other agent
             event_bus.publish(response["result"])
+            print(f"[{context_id}] 📤 Relayed response sent.")
 
         except Exception as e:
             # Handle errors (e.g., agent not found, network issues)
+            print(f"[{context_id}] 💥 Error during execution: {e}")
             error_message: Message = {
                 "kind": "message",
                 "messageId": str(uuid.uuid4()),

@@ -47,7 +47,7 @@ class Executor implements AgentExecutor {
       // Extract user's message text
       const userText = userMessage?.parts?.find(p => p.kind === 'text')?.text || '';
       
-      console.log(`[${taskId}] Received message: "${userText}"`);
+      console.log(`[${taskId}] 📩 Message received: "${userText}"`);
 
       // Generate response using AI or fallback logic
       let responseText: string;
@@ -55,18 +55,20 @@ class Executor implements AgentExecutor {
       if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'dummy-key') {
         // Use AI to generate a helpful response
         try {
+          console.log(`[${taskId}] 🧠 Calling OpenAI to generate response...`);
           const { text } = await generateText({
             model: openai('gpt-4-turbo'),
             prompt: `You are a helpful assistant named ${agentCard.name}. Respond to the user's message: "${userText}"`,
           });
           responseText = text || 'I apologize, but I could not generate a response.';
         } catch (error: any) {
-          console.error('OpenAI error:', error.message);
+          console.error(`[${taskId}]  OpenAI error:`, error.message);
           // Fallback to simple echo response
           responseText = this.generateFallbackResponse(userText);
         }
       } else {
         // Simple echo response when no AI is configured
+        console.log(`[${taskId}] 🤖 Generating fallback response...`);
         responseText = this.generateFallbackResponse(userText);
       }
 
@@ -82,10 +84,10 @@ class Executor implements AgentExecutor {
       eventBus.publish(responseMessage);
       eventBus.finished();
 
-      console.log(`[${taskId}] Response sent successfully`);
+      console.log(`[${taskId}] 📤 Response sent.`);
 
     } catch (error: any) {
-      console.error(`[${taskId}] Error:`, error.message);
+      console.error(`[${taskId}] 💥 Error during execution:`, error.message);
       
       // Publish error message
       const errorMessage: Message = {

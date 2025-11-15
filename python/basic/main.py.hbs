@@ -1,196 +1,144 @@
 import os
 import json
 import uuid
-from a2a.server import A2AServer, AgentExecutor, AgentCard, Skill
-from a2a.types import Message, MessagePart, Role, RequestContext, ExecutionEventBus
+import uvicorn
+from fastapi import FastAPI
 from dotenv import load_dotenv
 
-# Uncomment if using OpenAI
-# from openai import OpenAI
+from a2a_sdk.sdk import Message
+from a2a_sdk.server.fastapi import A2AFastAPIApp
+from a2a_sdk.server import (
+    AgentExecutor,
+    DefaultRequestHandler,
+    ExecutionEventBus,
+    InMemoryTaskStore,
+    RequestContext,
+)
+from openai import AsyncOpenAI
 
+# Load environment variables from .env file
 load_dotenv()
 
 # Initialize OpenAI client (optional)
-# openai_client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+has_openai_key = (
+    os.getenv("OPENAI_API_KEY") and os.getenv("OPENAI_API_KEY") != "dummy-key"
+)
+openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
-# Load Agent Card from .agent-card.json
-with open('.agent-card.json', 'r') as f:
-    agent_config = json.load(f)
+# Load agent card from .agent-card.json
+with open(".agent-card.json", "r") as f:
+    agent_card = json.load(f)
 
 # Override URL from environment if present
 if os.getenv("AGENT_URL"):
-    agent_config['url'] = os.getenv("AGENT_URL")
-
-# Create AgentCard from config
-agent_card = AgentCard(
-    name=agent_config['name'],
-    description=agent_config.get('description', ''),
-    protocol_version=agent_config.get('protocolVersion', '0.3.0'),
-    version=agent_config.get('version', '0.1.0'),
-    url=agent_config.get('url', 'http://localhost:8080'),
-    skills=[
-        Skill(
-            id=skill['id'],
-            name=skill['name'],
-            description=skill.get('description', ''),
-            tags=skill.get('tags', [])
-        )
-        for skill in agent_config.get('skills', [])
-    ]
-)
+    agent_card["url"] = os.getenv("AGENT_URL")
 
 
 class Executor(AgentExecutor):
     """
-    Executor - Implements the core agent logic
-    
-    This executor processes incoming messages from users and generates responses.
-    In the A2A protocol, agents receive messages (not skill-specific requests),
-    so the agent's logic determines how to interpret and respond to the user's intent.
+    Implements the core agent logic for the basic template.
     """
-    
+
     async def execute(
-        self,
-        request_context: RequestContext,
-        event_bus: ExecutionEventBus
-    ) -> None:
+        self, request_context: RequestContext, event_bus: ExecutionEventBus
+    ):
         task_id = request_context.task_id
         context_id = request_context.context_id
         user_message = request_context.user_message
 
         try:
-            # Extract user's message text
-            user_text = ""
-            if user_message and user_message.parts:
-                for part in user_message.parts:
-                    if part.kind == "text":
-                        user_text = part.text
-                        break
-            
-            print(f"[{task_id}] Received message: \"{user_text}\"")
-
-            # Generate response using AI or fallback logic
-            if os.getenv("OPENAI_API_KEY"):
-                # Use AI to generate a helpful response
-                try:
-                    # Uncomment to use OpenAI:
-                    # response = openai_client.chat.completions.create(
-                    #     model="gpt-4-turbo",
-                    #     messages=[
-                    #         {"role": "system", "content": f"You are a helpful assistant named {agent_card.name}."},
-                    #         {"role": "user", "content": user_text}
-                    #     ]
-                    # )
-                    # response_text = response.choices[0].message.content
-                    
-                    # For now, use fallback since OpenAI is commented out
-                    response_text = self.generate_fallback_response(user_text)
-                except Exception as error:
-                    print(f"OpenAI error: {error}")
-                    response_text = self.generate_fallback_response(user_text)
-            else:
-                # Simple echo response when no AI is configured
-                response_text = self.generate_fallback_response(user_text)
-
-            # Create and publish response message
-            response_message = Message(
-                kind="message",
-                message_id=str(uuid.uuid4()),
-                role=Role.AGENT,
-                parts=[MessagePart(kind="text", text=response_text)],
-                context_id=context_id,
+            user_text = next(
+                (p["text"] for p in user_message["parts"] if p["kind"] == "text"), ""
             )
+            print(f'[{task_id}] 📩 Message received: "{user_text}"')
+
+            response_text = ""
+            if has_openai_key:
+                try:
+                    print(f"[{task_id}] 🧠 Calling OpenAI to generate response...")
+                    response = await openai_client.chat.completions.create(
+                        model="gpt-4-turbo",
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": f"You are a helpful assistant named {agent_card['name']}.",
+                            },
+                            {"role": "user", "content": user_text},
+                        ],
+                    )
+                    response_text = response.choices[0].message.content
+                except Exception as e:
+                    print(f"[{task_id}]  OpenAI error: {e}")
+                    response_text = self._generate_fallback_response(user_text)
+            else:
+                print(f"[{task_id}] 🤖 Generating fallback response...")
+                response_text = self._generate_fallback_response(user_text)
+
+            response_message: Message = {
+                "kind": "message",
+                "messageId": str(uuid.uuid4()),
+                "role": "agent",
+                "parts": [{"kind": "text", "text": response_text or ""}],
+                "contextId": context_id,
+            }
 
             event_bus.publish(response_message)
-            event_bus.finished()
+            print(f"[{task_id}] 📤 Response sent.")
 
-            print(f"[{task_id}] Response sent successfully")
-
-        except Exception as error:
-            print(f"[{task_id}] Error: {error}")
-            
-            # Publish error message
-            error_message = Message(
-                kind="message",
-                message_id=str(uuid.uuid4()),
-                role=Role.AGENT,
-                parts=[MessagePart(
-                    kind="text", 
-                    text=f"I encountered an error processing your request: {str(error)}"
-                )],
-                context_id=context_id,
-            )
-
+        except Exception as e:
+            print(f"[{task_id}] 💥 Error during execution: {e}")
+            error_message: Message = {
+                "kind": "message",
+                "messageId": str(uuid.uuid4()),
+                "role": "agent",
+                "parts": [
+                    {
+                        "kind": "text",
+                        "text": f"I encountered an error processing your request: {e}",
+                    }
+                ],
+                "contextId": context_id,
+            }
             event_bus.publish(error_message)
+        finally:
             event_bus.finished()
 
-    def generate_fallback_response(self, user_text: str) -> str:
-        """Generate a simple fallback response when AI is not available"""
+    def _generate_fallback_response(self, user_text: str) -> str:
         lower_text = user_text.lower()
-        
         if "hello" in lower_text or "hi" in lower_text:
-            return f"Hello! I'm {agent_card.name}, your AI assistant. How can I help you today?"
-        
+            return f"Hello! I'm {agent_card['name']}, your AI assistant. How can I help you today?"
         if "help" in lower_text:
-            return ("I'm here to help! You can ask me questions or chat with me. "
-                   "For better responses, configure an OpenAI API key in your .env file.")
-        
+            return "I'm here to help! For better responses, configure an OpenAI API key."
         if "what" in lower_text and "do" in lower_text:
-            return ("I'm an A2A-compliant AI agent. I can understand your messages and provide helpful responses. "
-                   "Try asking me questions or chatting with me!")
-        
-        # Default echo response
-        return (f'You said: "{user_text}". I\'m currently running in simple mode. '
-               f'Configure OPENAI_API_KEY in .env for AI-powered responses!')
+            return "I am an A2A-compliant AI agent. Try asking me questions!"
+        return f'You said: "{user_text}". I am in simple mode. Configure OPENAI_API_KEY for AI responses.'
 
-    async def cancel_task(self, task_id: str, event_bus: ExecutionEventBus) -> None:
-        """
-        Handle task cancellation (required by AgentExecutor interface)
-        This is called when a user cancels a long-running task
-        """
+    async def cancel_task(self, task_id: str, event_bus: ExecutionEventBus):
         print(f"[{task_id}] Task cancellation requested")
-        # For simple message-response agents, cancellation might not be needed
-        # For long-running tasks, implement cancellation logic here
 
 
-# Custom middleware for OpenHive Platform authentication
-async def auth_middleware(request, call_next):
-    """Check X-OpenHive-Secret header when deployed"""
-    if os.getenv("NODE_ENV") == "production" and os.getenv("X_OPENHIVE_SECRET"):
-        secret = request.headers.get("x-openhive-secret")
-        if secret != os.getenv("X_OPENHIVE_SECRET"):
-            from starlette.responses import JSONResponse
-            return JSONResponse(
-                status_code=403,
-                content={"error": "Forbidden"}
-            )
-    response = await call_next(request)
-    return response
-
+# Initialize A2A Server
+app = FastAPI()
+agent_executor = Executor()
+task_store = InMemoryTaskStore()
+request_handler = DefaultRequestHandler(
+    agent_card=agent_card, task_store=task_store, agent_executor=agent_executor
+)
+app_builder = A2AFastAPIApp(request_handler=request_handler)
+app_builder.setup_routes(app)
 
 if __name__ == "__main__":
-    # Initialize A2A Server
-    port = int(os.getenv("PORT", 8080))
-    executor = Executor()
-    server = A2AServer(agent_card=agent_card, executor=executor)
+    port = int(os.environ.get("PORT", 8080))
+    skill_names = ", ".join([s["id"] for s in agent_card.get("skills", [])])
 
-    # Add custom middleware for OpenHive platform authentication
-    if os.getenv("NODE_ENV") == "production" and os.getenv("X_OPENHIVE_SECRET"):
-        server.app.middleware("http")(auth_middleware)
-
-    print(f"🚀 A2A Agent \"{agent_card.name}\" starting on port {port}")
+    print(f"🚀 A2A Agent \"{agent_card['name']}\" starting on port {port}")
     print(f"📋 Agent Card: http://localhost:{port}/.well-known/agent-card.json")
-    print(f"🔧 Skills: {', '.join(skill.id for skill in agent_card.skills)}")
-    print()
-    print("💡 Try sending a message:")
+    print(f"🔧 Skills: {skill_names}")
+    print("\n💡 Try sending a message:")
     print("   - 'Hello'")
-    print("   - 'What can you do?'")
-    print("   - 'Help me with something'")
-    print()
-    if not os.getenv("OPENAI_API_KEY"):
+    print("   - 'What can you do?'\n")
+    if not has_openai_key:
         print("⚠️  No OPENAI_API_KEY found - running in simple mode")
-        print("   Set OPENAI_API_KEY in .env for AI-powered responses")
-        print()
+        print("   Set OPENAI_API_KEY in .env for AI-powered responses\n")
 
-    # Run the server
-    server.run(host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=port)

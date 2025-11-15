@@ -38,9 +38,12 @@ class Executor implements AgentExecutor {
     const {contextId, userMessage} = requestContext
     const userText =
       userMessage?.parts?.find(p => p.kind === 'text')?.text || ''
+    
+    console.log(`[${contextId}] 📩 Message received: "${userText}"`);
 
     try {
       // 1. Find a chat agent in the registry
+      console.log(`[${contextId}] 🔍 Searching for a 'chat' agent in the registry...`);
       const searchResults = await registry.search('skill:chat')
       const chatAgent = searchResults.find(
         // Ensure we don't find and call ourselves in a loop
@@ -48,8 +51,11 @@ class Executor implements AgentExecutor {
       )
 
       if (!chatAgent) {
+        console.log(`[${contextId}] ❌ No other 'chat' agent found.`);
         throw new Error("No other 'chat' agent found in the local registry.")
       }
+
+      console.log(`[${contextId}] ✅ Found agent: "${chatAgent.name}" at ${chatAgent.url}`);
 
       // 2. Connect to the found agent
       const client = await A2AClient.fromCardUrl(
@@ -57,6 +63,7 @@ class Executor implements AgentExecutor {
       )
 
       // 3. Relay the user's message to the other agent
+      console.log(`[${contextId}] 📲 Relaying message to "${chatAgent.name}"...`);
       const sendParams: MessageSendParams = {
         message: {
           ...userMessage,
@@ -65,6 +72,7 @@ class Executor implements AgentExecutor {
       }
 
       const response = await client.sendMessage(sendParams)
+      console.log(`[${contextId}] 📩 Received response from "${chatAgent.name}".`);
 
       if ('error' in response) {
         throw new Error(
@@ -74,8 +82,10 @@ class Executor implements AgentExecutor {
 
       // 4. Return the response from the other agent
       eventBus.publish(response.result as Message)
+      console.log(`[${contextId}] 📤 Relayed response sent.`);
     } catch (error: any) {
       // Handle errors (e.g., agent not found, network issues)
+      console.error(`[${contextId}] 💥 Error during execution:`, error.message);
       const errorMessage: Message = {
         kind: 'message',
         messageId: uuidv4(),
