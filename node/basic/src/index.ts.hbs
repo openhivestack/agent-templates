@@ -1,0 +1,185 @@
+import express from 'express';
+import { v4 as uuidv4 } from 'uuid';
+import type { AgentCard, Message } from '@a2a-js/sdk';
+import {
+  AgentExecutor,
+  RequestContext,
+  ExecutionEventBus,
+  DefaultRequestHandler,
+  InMemoryTaskStore,
+} from '@a2a-js/sdk/server';
+import { A2AExpressApp } from '@a2a-js/sdk/server/express';
+import { createOpenAI } from '@ai-sdk/openai';
+import { generateText } from 'ai';
+import * as dotenv from 'dotenv';
+import * as fs from 'fs';
+
+dotenv.config();
+
+// Load Agent Card from .agent-card.json
+const agentCard: AgentCard = JSON.parse(fs.readFileSync('.agent-card.json', 'utf8'));
+
+// Override URL from environment if present
+if (process.env.AGENT_URL) {
+  agentCard.url = process.env.AGENT_URL;
+}
+
+// Initialize OpenAI (optional - for AI capabilities)
+const openai = createOpenAI({
+  apiKey: process.env.OPENAI_API_KEY || 'dummy-key',
+});
+
+/**
+ * Executor - Implements the core agent logic
+ * 
+ * This executor processes incoming messages from users and generates responses.
+ * In the A2A protocol, agents receive messages (not skill-specific requests),
+ * so the agent's logic determines how to interpret and respond to the user's intent.
+ */
+class Executor implements AgentExecutor {
+  async execute(
+    requestContext: RequestContext,
+    eventBus: ExecutionEventBus
+  ): Promise<void> {
+    const { taskId, contextId, userMessage } = requestContext;
+
+    try {
+      // Extract user's message text
+      const userText = userMessage?.parts?.find(p => p.kind === 'text')?.text || '';
+      
+      console.log(`[${taskId}] Received message: "${userText}"`);
+
+      // Generate response using AI or fallback logic
+      let responseText: string;
+      
+      if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'dummy-key') {
+        // Use AI to generate a helpful response
+        try {
+          const { text } = await generateText({
+            model: openai('gpt-4-turbo'),
+            prompt: `You are a helpful assistant named ${agentCard.name}. Respond to the user's message: "${userText}"`,
+          });
+          responseText = text || 'I apologize, but I could not generate a response.';
+        } catch (error: any) {
+          console.error('OpenAI error:', error.message);
+          // Fallback to simple echo response
+          responseText = this.generateFallbackResponse(userText);
+        }
+      } else {
+        // Simple echo response when no AI is configured
+        responseText = this.generateFallbackResponse(userText);
+      }
+
+      // Create and publish response message
+      const responseMessage: Message = {
+        kind: 'message',
+        messageId: uuidv4(),
+        role: 'agent',
+        parts: [{ kind: 'text', text: responseText }],
+        contextId: contextId,
+      };
+
+      eventBus.publish(responseMessage);
+      eventBus.finished();
+
+      console.log(`[${taskId}] Response sent successfully`);
+
+    } catch (error: any) {
+      console.error(`[${taskId}] Error:`, error.message);
+      
+      // Publish error message
+      const errorMessage: Message = {
+        kind: 'message',
+        messageId: uuidv4(),
+        role: 'agent',
+        parts: [{ 
+          kind: 'text', 
+          text: `I encountered an error processing your request: ${error.message}` 
+        }],
+        contextId: contextId,
+      };
+
+      eventBus.publish(errorMessage);
+      eventBus.finished();
+    }
+  }
+
+  /**
+   * Generate a simple fallback response when AI is not available
+   */
+  private generateFallbackResponse(userText: string): string {
+    const lowerText = userText.toLowerCase();
+    
+    if (lowerText.includes('hello') || lowerText.includes('hi')) {
+      return `Hello! I'm ${agentCard.name}, your AI assistant. How can I help you today?`;
+    }
+    
+    if (lowerText.includes('help')) {
+      return 'I\'m here to help! You can ask me questions or chat with me. ' +
+             'For better responses, configure an OpenAI API key in your .env file.';
+    }
+    
+    if (lowerText.includes('what') && lowerText.includes('do')) {
+      return 'I\'m an A2A-compliant AI agent. I can understand your messages and provide helpful responses. ' +
+             'Try asking me questions or chatting with me!';
+    }
+    
+    // Default echo response
+    return `You said: "${userText}". I'm currently running in simple mode. ` +
+           `Configure OPENAI_API_KEY in .env for AI-powered responses!`;
+  }
+
+  /**
+   * Handle task cancellation (required by AgentExecutor interface)
+   * This is called when a user cancels a long-running task
+   */
+  async cancelTask(taskId: string, eventBus: ExecutionEventBus): Promise<void> {
+    console.log(`[${taskId}] Task cancellation requested`);
+    // For simple message-response agents, cancellation might not be needed
+    // For long-running tasks, implement cancellation logic here
+  }
+}
+
+// Initialize A2A Server
+const port = parseInt(process.env.PORT || '8080', 10);
+const agentExecutor = new Executor();
+const taskStore = new InMemoryTaskStore();
+const requestHandler = new DefaultRequestHandler(
+  agentCard,
+  taskStore,
+  agentExecutor
+);
+const appBuilder = new A2AExpressApp(requestHandler);
+
+// Setup Express app and A2A routes
+const app = appBuilder.setupRoutes(express());
+
+// Security: Check X-OpenHive-Secret header (when deployed)
+if (process.env.NODE_ENV === 'production' && process.env.X_OPENHIVE_SECRET) {
+  app.use((req, res, next) => {
+    const secret = req.headers['x-openhive-secret'];
+    if (secret !== process.env.X_OPENHIVE_SECRET) {
+      return res.status(403).json({ error: 'Forbidden' });
+    }
+    next();
+  });
+}
+
+// Start server
+app.listen(port, () => {
+  console.log(`🚀 A2A Agent "${agentCard.name}" listening on port ${port}`);
+  console.log(`📋 Agent Card: http://localhost:${port}/.well-known/agent-card.json`);
+  console.log(`🔧 Skills: ${agentCard.skills.map((s) => s.id).join(', ')}`);
+  console.log();
+  console.log('💡 Try sending a message:');
+  console.log("   - 'Hello'");
+  console.log("   - 'What can you do?'");
+  console.log("   - 'Help me with something'");
+  console.log();
+  
+  if (!process.env.OPENAI_API_KEY || process.env.OPENAI_API_KEY === 'dummy-key') {
+    console.log('⚠️  No OPENAI_API_KEY found - running in simple mode');
+    console.log('   Set OPENAI_API_KEY in .env for AI-powered responses');
+    console.log();
+  }
+});

@@ -1,0 +1,16 @@
+{
+  "node": {
+    "basic": {
+      "name": "node-basic",
+      "description": "A basic Node.js agent template",
+      "location": "node/basic"
+    }
+  },
+  "python": {
+    "basic": {
+      "name": "python-basic",
+      "description": "A basic Python agent template",
+      "location": "python/basic"
+    }
+  }
+}
