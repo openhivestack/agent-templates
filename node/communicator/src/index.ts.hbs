@@ -1,0 +1,120 @@
+import express from 'express'
+import {v4 as uuidv4} from 'uuid'
+import type {AgentCard, Message, MessageSendParams} from '@a2a-js/sdk'
+import {A2AClient} from '@a2a-js/sdk/client'
+import {
+  AgentExecutor,
+  RequestContext,
+  ExecutionEventBus,
+  DefaultRequestHandler,
+  InMemoryTaskStore,
+} from '@a2a-js/sdk/server'
+import {A2AExpressApp} from '@a2a-js/sdk/server/express'
+import {RemoteRegistry} from '@open-hive/core'
+import * as dotenv from 'dotenv'
+import * as fs from 'fs'
+
+dotenv.config()
+
+// Load Agent Card from .agent-card.json
+const agentCard: AgentCard = JSON.parse(
+  fs.readFileSync('.agent-card.json', 'utf8'),
+)
+
+// Initialize the remote registry client
+const registry = new RemoteRegistry('http://localhost:4001')
+
+/**
+ * Executor - Implements the core agent logic
+ *
+ * This executor receives a message, finds another agent with the 'chat' skill,
+ * relays the message to it, and then returns the response.
+ */
+class Executor implements AgentExecutor {
+  async execute(
+    requestContext: RequestContext,
+    eventBus: ExecutionEventBus,
+  ): Promise<void> {
+    const {contextId, userMessage} = requestContext
+    const userText =
+      userMessage?.parts?.find(p => p.kind === 'text')?.text || ''
+
+    try {
+      // 1. Find a chat agent in the registry
+      const searchResults = await registry.search('skill:chat')
+      const chatAgent = searchResults.find(
+        // Ensure we don't find and call ourselves in a loop
+        agent => agent.name !== agentCard.name,
+      )
+
+      if (!chatAgent) {
+        throw new Error("No other 'chat' agent found in the local registry.")
+      }
+
+      // 2. Connect to the found agent
+      const client = await A2AClient.fromCardUrl(
+        `${chatAgent.url}/.well-known/agent-card.json`,
+      )
+
+      // 3. Relay the user's message to the other agent
+      const sendParams: MessageSendParams = {
+        message: {
+          ...userMessage,
+          messageId: uuidv4(), // Generate a new ID for the relayed message
+        },
+      }
+
+      const response = await client.sendMessage(sendParams)
+
+      if ('error' in response) {
+        throw new Error(
+          `Error from relayed agent: ${response.error.message}`,
+        )
+      }
+
+      // 4. Return the response from the other agent
+      eventBus.publish(response.result as Message)
+    } catch (error: any) {
+      // Handle errors (e.g., agent not found, network issues)
+      const errorMessage: Message = {
+        kind: 'message',
+        messageId: uuidv4(),
+        role: 'agent',
+        parts: [{kind: 'text', text: `Error: ${error.message}`}],
+        contextId: contextId,
+      }
+      eventBus.publish(errorMessage)
+    } finally {
+      eventBus.finished()
+    }
+  }
+
+  async cancelTask(
+    taskId: string,
+    eventBus: ExecutionEventBus,
+  ): Promise<void> {
+    console.log(`[${taskId}] Task cancellation requested`)
+  }
+}
+
+// Initialize A2A Server
+const port = Number.parseInt(process.env.PORT || '8080', 10)
+const agentExecutor = new Executor()
+const taskStore = new InMemoryTaskStore()
+const requestHandler = new DefaultRequestHandler(
+  agentCard,
+  taskStore,
+  agentExecutor,
+)
+const appBuilder = new A2AExpressApp(requestHandler)
+const app = appBuilder.setupRoutes(express())
+
+// Start server
+app.listen(port, () => {
+  console.log(
+    `🚀 A2A Communicator Agent "${agentCard.name}" listening on port ${port}`,
+  )
+  console.log(
+    `📋 Agent Card: http://localhost:${port}/.well-known/agent-card.json`,
+  )
+})

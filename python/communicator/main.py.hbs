@@ -1,0 +1,115 @@
+import asyncio
+import json
+import os
+import uvicorn
+import uuid
+from fastapi import FastAPI
+from dotenv import load_dotenv
+
+from a2a_sdk.client import A2AClient
+from a2a_sdk.server.fastapi import A2AFastAPIApp
+from a2a_sdk.server import (
+    AgentExecutor,
+    DefaultRequestHandler,
+    ExecutionEventBus,
+    InMemoryTaskStore,
+    RequestContext,
+)
+from a2a_sdk.sdk import Message, MessageSendParams
+from openhive import RemoteRegistry
+
+# Load environment variables from .env file
+load_dotenv()
+
+# Load agent card from .agent-card.json
+with open(".agent-card.json", "r") as f:
+    agent_card = json.load(f)
+
+# Initialize the remote registry client
+registry = RemoteRegistry(base_url="http://localhost:4001")
+
+
+class Executor(AgentExecutor):
+    """
+    Implements the core agent logic.
+    This executor receives a message, finds another agent with the 'chat' skill,
+    relays the message to it, and then returns the response.
+    """
+
+    async def execute(
+        self, request_context: RequestContext, event_bus: ExecutionEventBus
+    ):
+        user_message = request_context.user_message
+        context_id = request_context.context_id
+
+        try:
+            # 1. Find a chat agent in the registry
+            search_results = await registry.search("skill:chat")
+            # Ensure we don't find and call ourselves in a loop
+            chat_agent = next(
+                (
+                    agent
+                    for agent in search_results
+                    if agent["name"] != agent_card["name"]
+                ),
+                None,
+            )
+
+            if not chat_agent:
+                raise Exception("No other 'chat' agent found in the local registry.")
+
+            # 2. Connect to the found agent
+            card_url = f"{chat_agent['url']}/.well-known/agent-card.json"
+            client = await A2AClient.from_card_url(card_url)
+
+            # 3. Relay the user's message to the other agent
+            send_params: MessageSendParams = {
+                "message": {
+                    **user_message,
+                    "messageId": str(uuid.uuid4()),  # Generate a new ID
+                }
+            }
+            response = await client.send_message(send_params)
+
+            if "error" in response:
+                raise Exception(f"Error from relayed agent: {response['error']['message']}")
+
+            # 4. Return the response from the other agent
+            event_bus.publish(response["result"])
+
+        except Exception as e:
+            # Handle errors (e.g., agent not found, network issues)
+            error_message: Message = {
+                "kind": "message",
+                "messageId": str(uuid.uuid4()),
+                "role": "agent",
+                "parts": [{"kind": "text", "text": f"Error: {e}"}],
+                "contextId": context_id,
+            }
+            event_bus.publish(error_message)
+        finally:
+            event_bus.finished()
+
+    async def cancel_task(self, task_id: str, event_bus: ExecutionEventBus):
+        print(f"[{task_id}] Task cancellation requested")
+
+
+# Initialize A2A Server
+app = FastAPI()
+agent_executor = Executor()
+task_store = InMemoryTaskStore()
+request_handler = DefaultRequestHandler(
+    agent_card=agent_card, task_store=task_store, agent_executor=agent_executor
+)
+app_builder = A2AFastAPIApp(request_handler=request_handler)
+app_builder.setup_routes(app)
+
+if __name__ == "__main__":
+    port = int(os.environ.get("PORT", 8080))
+    print(
+        f"🚀 A2A Communicator Agent \"{agent_card['name']}\" listening on port {port}"
+    )
+    print(
+        f"📋 Agent Card: http://localhost:{port}/.well-known/agent-card.json"
+    )
+    uvicorn.run(app, host="0.0.0.0", port=port)

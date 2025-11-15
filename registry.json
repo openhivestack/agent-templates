@@ -2,15 +2,25 @@
   "node": {
     "basic": {
       "name": "node-basic",
-      "description": "A basic Node.js agent template",
+      "description": "A basic Node.js agent template that responds to messages.",
       "location": "node/basic"
+    },
+    "communicator": {
+      "name": "node-communicator",
+      "description": "A Node.js agent that finds another agent in the registry and relays messages to it.",
+      "location": "node/communicator"
     }
   },
   "python": {
     "basic": {
       "name": "python-basic",
-      "description": "A basic Python agent template",
+      "description": "A basic Python agent template that responds to messages.",
       "location": "python/basic"
+    },
+    "communicator": {
+      "name": "python-communicator",
+      "description": "A Python agent that finds another agent in the registry and relays messages to it.",
+      "location": "python/communicator"
     }
   }
 }
