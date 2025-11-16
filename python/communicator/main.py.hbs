@@ -3,19 +3,17 @@ import json
 import os
 import uvicorn
 import uuid
+from urllib.parse import urlparse
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
-from a2a_sdk.client import A2AClient
-from a2a_sdk.server.fastapi import A2AFastAPIApp
-from a2a_sdk.server import (
-    AgentExecutor,
-    DefaultRequestHandler,
-    ExecutionEventBus,
-    InMemoryTaskStore,
-    RequestContext,
-)
-from a2a_sdk.sdk import Message, MessageSendParams
+from a2a.client import A2AClient
+from a2a.server.apps.jsonrpc.fastapi_app import A2AFastAPIApplication
+from a2a.server.agent_execution import AgentExecutor
+from a2a.server.request_handlers.default_request_handler import DefaultRequestHandler
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.agent_execution.context import RequestContext
+from a2a.types import AgentCard, Message, MessageSendParams
 from openhive import RemoteRegistry
 
 # Load environment variables from .env file
@@ -23,7 +21,14 @@ load_dotenv()
 
 # Load agent card from .agent-card.json
 with open(".agent-card.json", "r") as f:
-    agent_card = json.load(f)
+    agent_card_dict = json.load(f)
+
+# Override URL from environment if present
+if os.getenv("AGENT_URL"):
+    agent_card_dict["url"] = os.getenv("AGENT_URL")
+
+# Convert dict to AgentCard object
+agent_card = AgentCard.model_validate(agent_card_dict)
 
 # Initialize the remote registry client
 registry = RemoteRegistry(base_url="http://localhost:4001")
@@ -37,7 +42,7 @@ class Executor(AgentExecutor):
     """
 
     async def execute(
-        self, request_context: RequestContext, event_bus: ExecutionEventBus
+        self, request_context: RequestContext, event_bus
     ):
         user_message = request_context.user_message
         context_id = request_context.context_id
@@ -55,7 +60,7 @@ class Executor(AgentExecutor):
                 (
                     agent
                     for agent in search_results
-                    if agent["name"] != agent_card["name"]
+                    if agent["name"] != agent_card.name
                 ),
                 None,
             )
@@ -102,7 +107,7 @@ class Executor(AgentExecutor):
         finally:
             event_bus.finished()
 
-    async def cancel_task(self, task_id: str, event_bus: ExecutionEventBus):
+    async def cancel(self, task_id: str, event_bus):
         print(f"[{task_id}] Task cancellation requested")
 
 
@@ -111,15 +116,20 @@ app = FastAPI()
 agent_executor = Executor()
 task_store = InMemoryTaskStore()
 request_handler = DefaultRequestHandler(
-    agent_card=agent_card, task_store=task_store, agent_executor=agent_executor
+    task_store=task_store, agent_executor=agent_executor
 )
-app_builder = A2AFastAPIApp(request_handler=request_handler)
-app_builder.setup_routes(app)
+app_builder = A2AFastAPIApplication(agent_card=agent_card, http_handler=request_handler)
+app_builder.add_routes_to_app(app, agent_card_url=str(".agent-card.json"))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
+    port_str = os.environ.get("PORT")
+    if port_str:
+        port = int(port_str)
+    else:
+        parsed_url = urlparse(agent_card.url)
+        port = parsed_url.port or 8082
     print(
-        f"🚀 A2A Communicator Agent \"{agent_card['name']}\" listening on port {port}"
+        f"🚀 A2A Communicator Agent \"{agent_card.name}\" listening on port {port}"
     )
     print(
         f"📋 Agent Card: http://localhost:{port}/.well-known/agent-card.json"

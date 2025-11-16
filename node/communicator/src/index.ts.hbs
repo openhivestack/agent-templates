@@ -13,6 +13,7 @@ import {A2AExpressApp} from '@a2a-js/sdk/server/express'
 import {RemoteRegistry} from '@open-hive/core'
 import * as dotenv from 'dotenv'
 import * as fs from 'fs'
+import { URL } from 'url';
 
 dotenv.config()
 
@@ -108,7 +109,9 @@ class Executor implements AgentExecutor {
 }
 
 // Initialize A2A Server
-const port = Number.parseInt(process.env.PORT || '8080', 10)
+const port = process.env.PORT
+  ? parseInt(process.env.PORT, 10)
+  : new URL(agentCard.url).port;
 const agentExecutor = new Executor()
 const taskStore = new InMemoryTaskStore()
 const requestHandler = new DefaultRequestHandler(

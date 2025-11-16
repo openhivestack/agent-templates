@@ -2,18 +2,18 @@ import os
 import json
 import uuid
 import uvicorn
+from urllib.parse import urlparse
 from fastapi import FastAPI
 from dotenv import load_dotenv
 
-from a2a_sdk.sdk import Message
-from a2a_sdk.server.fastapi import A2AFastAPIApp
-from a2a_sdk.server import (
-    AgentExecutor,
-    DefaultRequestHandler,
-    ExecutionEventBus,
-    InMemoryTaskStore,
-    RequestContext,
-)
+
+from a2a.server.apps.jsonrpc.fastapi_app import A2AFastAPIApplication
+from a2a.server.agent_execution import AgentExecutor
+from a2a.server.request_handlers.default_request_handler import DefaultRequestHandler
+from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
+from a2a.server.agent_execution.context import RequestContext
+from a2a.types import AgentCard
+
 from openai import AsyncOpenAI
 
 # Load environment variables from .env file
@@ -27,11 +27,14 @@ openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 
 # Load agent card from .agent-card.json
 with open(".agent-card.json", "r") as f:
-    agent_card = json.load(f)
+    agent_card_dict = json.load(f)
 
 # Override URL from environment if present
 if os.getenv("AGENT_URL"):
-    agent_card["url"] = os.getenv("AGENT_URL")
+    agent_card_dict["url"] = os.getenv("AGENT_URL")
+
+# Convert dict to AgentCard object
+agent_card = AgentCard.model_validate(agent_card_dict)
 
 
 class Executor(AgentExecutor):
@@ -40,7 +43,7 @@ class Executor(AgentExecutor):
     """
 
     async def execute(
-        self, request_context: RequestContext, event_bus: ExecutionEventBus
+        self, request_context: RequestContext, event_bus
     ):
         task_id = request_context.task_id
         context_id = request_context.context_id
@@ -61,7 +64,7 @@ class Executor(AgentExecutor):
                         messages=[
                             {
                                 "role": "system",
-                                "content": f"You are a helpful assistant named {agent_card['name']}.",
+                                "content": f"You are a helpful assistant named {agent_card.name}.",
                             },
                             {"role": "user", "content": user_text},
                         ],
@@ -74,7 +77,7 @@ class Executor(AgentExecutor):
                 print(f"[{task_id}] 🤖 Generating fallback response...")
                 response_text = self._generate_fallback_response(user_text)
 
-            response_message: Message = {
+            response_message = {
                 "kind": "message",
                 "messageId": str(uuid.uuid4()),
                 "role": "agent",
@@ -87,7 +90,7 @@ class Executor(AgentExecutor):
 
         except Exception as e:
             print(f"[{task_id}] 💥 Error during execution: {e}")
-            error_message: Message = {
+            error_message = {
                 "kind": "message",
                 "messageId": str(uuid.uuid4()),
                 "role": "agent",
@@ -106,14 +109,14 @@ class Executor(AgentExecutor):
     def _generate_fallback_response(self, user_text: str) -> str:
         lower_text = user_text.lower()
         if "hello" in lower_text or "hi" in lower_text:
-            return f"Hello! I'm {agent_card['name']}, your AI assistant. How can I help you today?"
+            return f"Hello! I'm {agent_card.name}, your AI assistant. How can I help you today?"
         if "help" in lower_text:
             return "I'm here to help! For better responses, configure an OpenAI API key."
         if "what" in lower_text and "do" in lower_text:
             return "I am an A2A-compliant AI agent. Try asking me questions!"
         return f'You said: "{user_text}". I am in simple mode. Configure OPENAI_API_KEY for AI responses.'
 
-    async def cancel_task(self, task_id: str, event_bus: ExecutionEventBus):
+    async def cancel(self, task_id: str, event_bus):
         print(f"[{task_id}] Task cancellation requested")
 
 
@@ -122,16 +125,22 @@ app = FastAPI()
 agent_executor = Executor()
 task_store = InMemoryTaskStore()
 request_handler = DefaultRequestHandler(
-    agent_card=agent_card, task_store=task_store, agent_executor=agent_executor
+    task_store=task_store, agent_executor=agent_executor
 )
-app_builder = A2AFastAPIApp(request_handler=request_handler)
-app_builder.setup_routes(app)
+app_builder = A2AFastAPIApplication(agent_card=agent_card, http_handler=request_handler)
+app_builder.add_routes_to_app(app, agent_card_url=str(".agent-card.json"))
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 8080))
-    skill_names = ", ".join([s["id"] for s in agent_card.get("skills", [])])
+    port_str = os.environ.get("PORT")
+    if port_str:
+        port = int(port_str)
+    else:
+        parsed_url = urlparse(agent_card.url)
+        port = parsed_url.port or 8082
 
-    print(f"🚀 A2A Agent \"{agent_card['name']}\" starting on port {port}")
+    skill_names = ", ".join([s.id for s in agent_card.skills or []])
+
+    print(f"🚀 A2A Agent \"{agent_card.name}\" starting on port {port}")
     print(f"📋 Agent Card: http://localhost:{port}/.well-known/agent-card.json")
     print(f"🔧 Skills: {skill_names}")
     print("\n💡 Try sending a message:")
