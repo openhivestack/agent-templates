@@ -14,7 +14,7 @@ from a2a.server.request_handlers.default_request_handler import DefaultRequestHa
 from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
 from a2a.server.agent_execution.context import RequestContext
 from a2a.types import AgentCard, Message, MessageSendParams
-from openhive import RemoteRegistry
+from openhive import OpenHive
 
 # Load environment variables from .env file
 load_dotenv()
@@ -31,7 +31,7 @@ if os.getenv("AGENT_URL"):
 agent_card = AgentCard.model_validate(agent_card_dict)
 
 # Initialize the remote registry client
-registry = RemoteRegistry(base_url="http://localhost:4001")
+registry = OpenHive(registry_url="http://localhost:4001")
 
 
 class Executor(AgentExecutor):
@@ -60,7 +60,7 @@ class Executor(AgentExecutor):
                 (
                     agent
                     for agent in search_results
-                    if agent["name"] != agent_card.name
+                    if agent.name != agent_card.name
                 ),
                 None,
             )
@@ -69,14 +69,14 @@ class Executor(AgentExecutor):
                 print(f"[{context_id}] ❌ No other 'chat' agent found.")
                 raise Exception("No other 'chat' agent found in the local registry.")
 
-            print(f"[{context_id}] ✅ Found agent: \"{chat_agent['name']}\" at {chat_agent['url']}")
+            print(f'[{context_id}] ✅ Found agent: "{chat_agent.name}" at {chat_agent.url}')
 
             # 2. Connect to the found agent
-            card_url = f"{chat_agent['url']}/.well-known/agent-card.json"
+            card_url = f"{chat_agent.url}/.well-known/agent-card.json"
             client = await A2AClient.from_card_url(card_url)
 
             # 3. Relay the user's message to the other agent
-            print(f"[{context_id}] 📲 Relaying message to \"{chat_agent['name']}\"...")
+            print(f'[{context_id}] 📲 Relaying message to "{chat_agent.name}"...')
             send_params: MessageSendParams = {
                 "message": {
                     **user_message,

@@ -10,10 +10,10 @@ import {
   InMemoryTaskStore,
 } from '@a2a-js/sdk/server'
 import {A2AExpressApp} from '@a2a-js/sdk/server/express'
-import {RemoteRegistry} from '@open-hive/core'
+import {OpenHive} from '@open-hive/sdk'
 import * as dotenv from 'dotenv'
 import * as fs from 'fs'
-import { URL } from 'url';
+import {URL} from 'url'
 
 dotenv.config()
 
@@ -23,7 +23,9 @@ const agentCard: AgentCard = JSON.parse(
 )
 
 // Initialize the remote registry client
-const registry = new RemoteRegistry('http://localhost:4001')
+const registry = new OpenHive({
+  registryUrl: 'http://localhost:4001',
+})
 
 /**
  * Executor - Implements the core agent logic
