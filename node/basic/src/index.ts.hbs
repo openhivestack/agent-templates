@@ -160,10 +160,10 @@ const appBuilder = new A2AExpressApp(requestHandler);
 const app = appBuilder.setupRoutes(express());
 
 // Security: Check X-OpenHive-Secret header (when deployed)
-if (process.env.NODE_ENV === 'production' && process.env.X_OPENHIVE_SECRET) {
+if (process.env.NODE_ENV === 'production' && process.env.OPENHIVE_SECRET) {
   app.use((req, res, next) => {
     const secret = req.headers['x-openhive-secret'];
-    if (secret !== process.env.X_OPENHIVE_SECRET) {
+    if (secret !== process.env.OPENHIVE_SECRET) {
       return res.status(403).json({ error: 'Forbidden' });
     }
     next();
