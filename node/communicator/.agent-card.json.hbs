@@ -1,23 +1,25 @@
 {
   "name": "{{agentName}}",
   "description": "An A2A-compliant Node.js agent that communicates with other agents.",
-  "protocolVersion": "0.3.0",
   "version": "0.1.0",
-  "defaultInputModes": ["text"],
-  "defaultOutputModes": ["text"],
-  "url": "http://localhost:8080",
+  "protocolVersion": "0.3.0",
   "runtime": "node",
-  "capabilities": {
-      "streaming": false,
-      "pushNotifications": false,
-      "stateTransitionHistory": false
-  },
+  "url": "http://localhost:4000",
   "skills": [
     {
-      "id": "chat-relay",
-      "name": "Chat Relay",
-      "description": "Relays messages to another chat agent found in the registry.",
-      "tags": ["communication", "demo"]
+      "id": "chat",
+      "name": "Chat",
+      "description": "Simple chat capability",
+      "tags": ["chat"]
     }
-  ]
+  ],
+  "dependencies": {
+    "@a2a-js/sdk": "^0.3.0",
+    "@ai-sdk/openai": "^0.0.12",
+    "@open-hive/sdk": "^0.11.1",
+    "ai": "^3.1.1",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "uuid": "^9.0.1"
+  }
 }

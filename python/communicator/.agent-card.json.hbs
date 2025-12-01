@@ -1,23 +1,23 @@
 {
   "name": "{{agentName}}",
   "description": "An A2A-compliant Python agent that communicates with other agents.",
-  "protocolVersion": "0.3.0",
   "version": "0.1.0",
-  "defaultInputModes": ["text"],
-  "defaultOutputModes": ["text"],
-  "url": "http://localhost:8080",
+  "protocolVersion": "0.3.0",
   "runtime": "python",
-  "capabilities": {
-      "streaming": false,
-      "pushNotifications": false,
-      "stateTransitionHistory": false
-  },
+  "url": "http://localhost:8000",
   "skills": [
     {
-      "id": "chat-relay",
-      "name": "Chat Relay",
-      "description": "Relays messages to another chat agent found in the registry.",
-      "tags": ["communication", "demo"]
+      "id": "chat",
+      "name": "Chat",
+      "description": "Simple chat capability",
+      "tags": ["chat"]
     }
-  ]
+  ],
+  "dependencies": {
+    "a2a-sdk": ">=0.3.0",
+    "fastapi": ">=0.111.0",
+    "uvicorn": ">=0.29.0",
+    "python-dotenv": ">=1.0.1",
+    "openhive": ">=0.10.2"
+  }
 }
