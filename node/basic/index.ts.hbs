@@ -1,6 +1,6 @@
 import express from 'express';
 import { v4 as uuidv4 } from 'uuid';
-import type { AgentCard, Message } from '@a2a-js/sdk';
+import type { AgentCard, Task, TaskStatusUpdateEvent, TaskArtifactUpdateEvent, Message } from '@a2a-js/sdk';
 import {
   AgentExecutor,
   RequestContext,
@@ -25,6 +25,13 @@ if (process.env.AGENT_URL) {
   agentCard.url = process.env.AGENT_URL;
 }
 
+// Ensure capabilities are set
+if (!agentCard.capabilities) {
+  agentCard.capabilities = {};
+}
+agentCard.capabilities.streaming = true;
+agentCard.capabilities.pushNotifications = true;
+
 // Initialize OpenAI (optional - for AI capabilities)
 const openai = createOpenAI({
   apiKey: process.env.OPENAI_API_KEY || 'dummy-key',
@@ -34,46 +41,109 @@ const openai = createOpenAI({
  * Executor - Implements the core agent logic
  * 
  * This executor processes incoming messages from users and generates responses.
- * In the A2A protocol, agents receive messages (not skill-specific requests),
- * so the agent's logic determines how to interpret and respond to the user's intent.
+ * It demonstrates:
+ * 1. Task creation and management (A2A Task Protocol)
+ * 2. Streaming status updates (submitted -> working -> completed)
+ * 3. Generating and sending Artifacts
+ * 4. Handling Cancellation
+ * 5. AI integration
  */
 class Executor implements AgentExecutor {
+  // Map to store AbortControllers for active tasks to support cancellation
+  private activeTasks = new Map<string, AbortController>();
+
   async execute(
     requestContext: RequestContext,
     eventBus: ExecutionEventBus
   ): Promise<void> {
-    const { taskId, contextId, userMessage } = requestContext;
+    const { taskId, contextId, userMessage, task } = requestContext;
+    
+    // Create an AbortController for this task
+    const controller = new AbortController();
+    this.activeTasks.set(taskId, controller);
 
     try {
+      // 1. Initialize Task if needed
+      // If the request didn't come with an existing task, we create one to track state.
+      if (!task) {
+        const initialTask: Task = {
+          kind: 'task',
+          id: taskId,
+          contextId: contextId,
+          status: {
+            state: 'submitted',
+            timestamp: new Date().toISOString(),
+          },
+          history: [userMessage]
+        };
+        eventBus.publish(initialTask);
+      }
+
       // Extract user's message text
       const userText = userMessage?.parts?.find(p => p.kind === 'text')?.text || '';
-      
       console.log(`[${taskId}] 📩 Message received: "${userText}"`);
 
-      // Generate response using AI or fallback logic
+      // 2. Update Status to 'working'
+      // This informs the client that the agent has accepted the task and is processing.
+      const workingUpdate: TaskStatusUpdateEvent = {
+        kind: 'status-update',
+        taskId,
+        contextId,
+        status: { state: 'working', timestamp: new Date().toISOString() },
+        final: false
+      };
+      eventBus.publish(workingUpdate);
+
+      // Check for cancellation before starting heavy work
+      if (controller.signal.aborted) return;
+
+      // 3. Generate Response (Simulate long running task or use AI)
       let responseText: string;
       
       if (process.env.OPENAI_API_KEY && process.env.OPENAI_API_KEY !== 'dummy-key') {
-        // Use AI to generate a helpful response
         try {
           console.log(`[${taskId}] 🧠 Calling OpenAI to generate response...`);
+          
+          // We can send an artifact to show "thinking" or intermediate steps
+          eventBus.publish({
+            kind: 'artifact-update',
+            taskId,
+            contextId,
+            artifact: {
+              artifactId: `thought-${Date.now()}`,
+              name: 'Thought Process',
+              parts: [{ kind: 'text', text: 'Analyzing your request...' }]
+            }
+          });
+
           const { text } = await generateText({
             model: openai('gpt-4-turbo'),
             prompt: `You are a helpful assistant named ${agentCard.name}. Respond to the user's message: "${userText}"`,
+            abortSignal: controller.signal,
           });
           responseText = text || 'I apologize, but I could not generate a response.';
         } catch (error: any) {
+          if (controller.signal.aborted || error.name === 'AbortError') {
+            console.log(`[${taskId}] 🛑 AI generation aborted.`);
+            return; // Exit gracefully
+          }
           console.error(`[${taskId}]  OpenAI error:`, error.message);
-          // Fallback to simple echo response
           responseText = this.generateFallbackResponse(userText);
         }
       } else {
-        // Simple echo response when no AI is configured
-        console.log(`[${taskId}] 🤖 Generating fallback response...`);
+        // Simulate some "work" time for the demo
+        console.log(`[${taskId}] 🤖 Generating fallback response (simulating work)...`);
+        await new Promise(resolve => setTimeout(resolve, 1000)); // 1s delay
         responseText = this.generateFallbackResponse(userText);
       }
 
-      // Create and publish response message
+      if (controller.signal.aborted) return;
+
+      // 4. Publish Final Response as an Artifact or Message
+      // In A2A, you can attach the main result as an artifact or just complete the task.
+      // We'll attach the response as a text artifact for clarity, or just use a Message.
+      // Usually, we send a 'message' event if it's a chat reply.
+      
       const responseMessage: Message = {
         kind: 'message',
         messageId: uuidv4(),
@@ -81,16 +151,35 @@ class Executor implements AgentExecutor {
         parts: [{ kind: 'text', text: responseText }],
         contextId: contextId,
       };
-
       eventBus.publish(responseMessage);
+
+      // 5. Mark Task as Completed
+      const completedUpdate: TaskStatusUpdateEvent = {
+        kind: 'status-update',
+        taskId,
+        contextId,
+        status: { state: 'completed', timestamp: new Date().toISOString() },
+        final: true,
+      };
+      eventBus.publish(completedUpdate);
       eventBus.finished();
 
-      console.log(`[${taskId}] 📤 Response sent.`);
+      console.log(`[${taskId}] 📤 Response sent and task completed.`);
 
     } catch (error: any) {
       console.error(`[${taskId}] 💥 Error during execution:`, error.message);
       
-      // Publish error message
+      // Publish error status
+      const errorUpdate: TaskStatusUpdateEvent = {
+        kind: 'status-update',
+        taskId,
+        contextId,
+        status: { state: 'failed', timestamp: new Date().toISOString() },
+        final: true,
+      };
+      eventBus.publish(errorUpdate);
+      
+      // Also send a helpful error message
       const errorMessage: Message = {
         kind: 'message',
         messageId: uuidv4(),
@@ -101,9 +190,11 @@ class Executor implements AgentExecutor {
         }],
         contextId: contextId,
       };
-
       eventBus.publish(errorMessage);
       eventBus.finished();
+    } finally {
+      // Cleanup
+      this.activeTasks.delete(taskId);
     }
   }
 
@@ -133,13 +224,28 @@ class Executor implements AgentExecutor {
   }
 
   /**
-   * Handle task cancellation (required by AgentExecutor interface)
+   * Handle task cancellation
    * This is called when a user cancels a long-running task
    */
   async cancelTask(taskId: string, eventBus: ExecutionEventBus): Promise<void> {
-    console.log(`[${taskId}] Task cancellation requested`);
-    // For simple message-response agents, cancellation might not be needed
-    // For long-running tasks, implement cancellation logic here
+    console.log(`[${taskId}] 🛑 Task cancellation requested`);
+    
+    const controller = this.activeTasks.get(taskId);
+    if (controller) {
+      controller.abort();
+      this.activeTasks.delete(taskId);
+    }
+
+    // Publish cancelled status
+    const cancelledUpdate: TaskStatusUpdateEvent = {
+      kind: 'status-update',
+      taskId,
+      contextId: 'unknown', // Often contextId is passed in execute, strictly we might need to store it or pass it here
+      status: { state: 'canceled', timestamp: new Date().toISOString() },
+      final: true,
+    };
+    eventBus.publish(cancelledUpdate);
+    eventBus.finished();
   }
 }
 

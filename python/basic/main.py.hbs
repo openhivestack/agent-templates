@@ -2,10 +2,11 @@ import os
 import json
 import uuid
 import uvicorn
+import asyncio
 from urllib.parse import urlparse
 from fastapi import FastAPI
 from dotenv import load_dotenv
-
+from datetime import datetime
 
 from a2a.server.apps.jsonrpc.fastapi_app import A2AFastAPIApplication
 from a2a.server.agent_execution import AgentExecutor
@@ -33,6 +34,12 @@ with open(".agent-card.json", "r") as f:
 if os.getenv("AGENT_URL"):
     agent_card_dict["url"] = os.getenv("AGENT_URL")
 
+# Ensure capabilities are set
+if "capabilities" not in agent_card_dict:
+    agent_card_dict["capabilities"] = {}
+agent_card_dict["capabilities"]["streaming"] = True
+agent_card_dict["capabilities"]["pushNotifications"] = True
+
 # Convert dict to AgentCard object
 agent_card = AgentCard.model_validate(agent_card_dict)
 
@@ -40,7 +47,15 @@ agent_card = AgentCard.model_validate(agent_card_dict)
 class Executor(AgentExecutor):
     """
     Implements the core agent logic for the basic template.
+    Demonstrates:
+    1. Task creation and management (A2A Task Protocol)
+    2. Streaming status updates (submitted -> working -> completed)
+    3. Generating and sending Artifacts
+    4. Handling Cancellation
     """
+    
+    def __init__(self):
+        self.cancelled_tasks = set()
 
     async def execute(
         self, request_context: RequestContext, event_bus
@@ -48,17 +63,60 @@ class Executor(AgentExecutor):
         task_id = request_context.task_id
         context_id = request_context.context_id
         user_message = request_context.user_message
+        task = request_context.task
 
         try:
+            # 1. Initialize Task if needed
+            if not task:
+                initial_task = {
+                    "kind": "task",
+                    "id": task_id,
+                    "contextId": context_id,
+                    "status": {
+                        "state": "submitted",
+                        "timestamp": datetime.utcnow().isoformat() + "Z",
+                    },
+                    "history": [user_message]
+                }
+                event_bus.publish(initial_task)
+
             user_text = next(
                 (p["text"] for p in user_message["parts"] if p["kind"] == "text"), ""
             )
             print(f'[{task_id}] 📩 Message received: "{user_text}"')
 
+            # 2. Update Status to 'working'
+            working_update = {
+                "kind": "status-update",
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": {"state": "working", "timestamp": datetime.utcnow().isoformat() + "Z"},
+                "final": False
+            }
+            event_bus.publish(working_update)
+
+            # Check for cancellation
+            if task_id in self.cancelled_tasks:
+                return self._handle_cancelled(task_id, context_id, event_bus)
+
             response_text = ""
+            
             if has_openai_key:
                 try:
                     print(f"[{task_id}] 🧠 Calling OpenAI to generate response...")
+                    
+                    # Send an artifact to show "thinking"
+                    event_bus.publish({
+                        "kind": "artifact-update",
+                        "taskId": task_id,
+                        "contextId": context_id,
+                        "artifact": {
+                            "artifactId": f"thought-{int(datetime.utcnow().timestamp())}",
+                            "name": "Thought Process",
+                            "parts": [{"kind": "text", "text": "Analyzing your request..."}]
+                        }
+                    })
+
                     response = await openai_client.chat.completions.create(
                         model="gpt-4-turbo",
                         messages=[
@@ -68,15 +126,32 @@ class Executor(AgentExecutor):
                             },
                             {"role": "user", "content": user_text},
                         ],
+                        # We could enable streaming here and publish partial updates if A2A supports it
+                        # For now, we await the full response to keep it simple, but check cancellation
                     )
+                    
+                    if task_id in self.cancelled_tasks:
+                        return self._handle_cancelled(task_id, context_id, event_bus)
+                        
                     response_text = response.choices[0].message.content
+                    
                 except Exception as e:
                     print(f"[{task_id}]  OpenAI error: {e}")
                     response_text = self._generate_fallback_response(user_text)
             else:
-                print(f"[{task_id}] 🤖 Generating fallback response...")
+                # Simulate work
+                print(f"[{task_id}] 🤖 Generating fallback response (simulating work)...")
+                for _ in range(10): # 1 second delay split into checks
+                    if task_id in self.cancelled_tasks:
+                        return self._handle_cancelled(task_id, context_id, event_bus)
+                    await asyncio.sleep(0.1)
+                    
                 response_text = self._generate_fallback_response(user_text)
 
+            if task_id in self.cancelled_tasks:
+                return self._handle_cancelled(task_id, context_id, event_bus)
+
+            # 3. Publish Final Response
             response_message = {
                 "kind": "message",
                 "messageId": str(uuid.uuid4()),
@@ -84,9 +159,18 @@ class Executor(AgentExecutor):
                 "parts": [{"kind": "text", "text": response_text or ""}],
                 "contextId": context_id,
             }
-
             event_bus.publish(response_message)
-            print(f"[{task_id}] 📤 Response sent.")
+
+            # 4. Mark Task as Completed
+            completed_update = {
+                "kind": "status-update",
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": {"state": "completed", "timestamp": datetime.utcnow().isoformat() + "Z"},
+                "final": True,
+            }
+            event_bus.publish(completed_update)
+            print(f"[{task_id}] 📤 Response sent and task completed.")
 
         except Exception as e:
             print(f"[{task_id}] 💥 Error during execution: {e}")
@@ -103,8 +187,30 @@ class Executor(AgentExecutor):
                 "contextId": context_id,
             }
             event_bus.publish(error_message)
+            # Mark as failed
+            event_bus.publish({
+                "kind": "status-update",
+                "taskId": task_id,
+                "contextId": context_id,
+                "status": {"state": "failed", "timestamp": datetime.utcnow().isoformat() + "Z"},
+                "final": True,
+            })
         finally:
+            # Clean up cancellation set
+            if task_id in self.cancelled_tasks:
+                self.cancelled_tasks.remove(task_id)
             event_bus.finished()
+
+    def _handle_cancelled(self, task_id, context_id, event_bus):
+        print(f"[{task_id}] 🛑 Execution aborted due to cancellation.")
+        event_bus.publish({
+            "kind": "status-update",
+            "taskId": task_id,
+            "contextId": context_id,
+            "status": {"state": "canceled", "timestamp": datetime.utcnow().isoformat() + "Z"},
+            "final": True,
+        })
+        return
 
     def _generate_fallback_response(self, user_text: str) -> str:
         lower_text = user_text.lower()
@@ -116,8 +222,14 @@ class Executor(AgentExecutor):
             return "I am an A2A-compliant AI agent. Try asking me questions!"
         return f'You said: "{user_text}". I am in simple mode. Configure OPENAI_API_KEY for AI responses.'
 
-    async def cancel(self, task_id: str, event_bus):
-        print(f"[{task_id}] Task cancellation requested")
+    async def cancel_task(self, task_id: str, event_bus):
+        print(f"[{task_id}] 🛑 Task cancellation requested")
+        self.cancelled_tasks.add(task_id)
+        # Note: The execute loop picks up this flag. 
+        # We don't publish the 'canceled' event here to avoid race conditions,
+        # relying on execute() to publish it when it exits.
+        
+
 
 
 # Initialize A2A Server
