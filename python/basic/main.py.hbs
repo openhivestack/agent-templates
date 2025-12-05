@@ -6,13 +6,23 @@ import asyncio
 from urllib.parse import urlparse
 from fastapi import FastAPI
 from dotenv import load_dotenv
-from datetime import datetime
+from datetime import datetime, timezone
 
 from a2a.server.apps.jsonrpc.fastapi_app import A2AFastAPIApplication
 from a2a.server.agent_execution import AgentExecutor
 from a2a.server.request_handlers.default_request_handler import DefaultRequestHandler
 from a2a.server.tasks.inmemory_task_store import InMemoryTaskStore
 from a2a.server.agent_execution.context import RequestContext
+from a2a.types import (
+    TaskStatusUpdateEvent,
+    TaskArtifactUpdateEvent,
+    TaskStatus,
+    TaskState,
+    Artifact,
+    Message,
+    TextPart,
+    Part,
+)
 from a2a.types import AgentCard
 
 from openai import AsyncOpenAI
@@ -62,42 +72,46 @@ class Executor(AgentExecutor):
     ):
         task_id = request_context.task_id
         context_id = request_context.context_id
-        user_message = request_context.user_message
-        task = request_context.task
+        user_message = request_context.message
+        task = request_context.current_task
 
         try:
             # 1. Initialize Task if needed
             if not task:
-                initial_task = {
-                    "kind": "task",
-                    "id": task_id,
-                    "contextId": context_id,
-                    "status": {
-                        "state": "submitted",
-                        "timestamp": datetime.utcnow().isoformat() + "Z",
-                    },
-                    "history": [user_message]
-                }
-                event_bus.publish(initial_task)
+                initial_task = TaskStatusUpdateEvent(
+                    kind="status-update",
+                    taskId=task_id,
+                    contextId=context_id,
+                    status=TaskStatus(
+                        state=TaskState.submitted,
+                        timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    ),
+                    final=False,
+                )
+                await event_bus.enqueue_event(initial_task)
 
             user_text = next(
-                (p["text"] for p in user_message["parts"] if p["kind"] == "text"), ""
+                (p.root.text for p in user_message.parts if p.root.kind == "text"), ""
             )
             print(f'[{task_id}] 📩 Message received: "{user_text}"')
 
             # 2. Update Status to 'working'
-            working_update = {
-                "kind": "status-update",
-                "taskId": task_id,
-                "contextId": context_id,
-                "status": {"state": "working", "timestamp": datetime.utcnow().isoformat() + "Z"},
-                "final": False
-            }
-            event_bus.publish(working_update)
+
+            working_update = TaskStatusUpdateEvent(
+                kind="status-update",
+                taskId=task_id,
+                contextId=context_id,
+                status=TaskStatus(
+                    state=TaskState.working,
+                    timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                ),
+                final=False,
+            )
+            await event_bus.enqueue_event(working_update)
 
             # Check for cancellation
             if task_id in self.cancelled_tasks:
-                return self._handle_cancelled(task_id, context_id, event_bus)
+                return await self._handle_cancelled(task_id, context_id, event_bus)
 
             response_text = ""
             
@@ -106,16 +120,18 @@ class Executor(AgentExecutor):
                     print(f"[{task_id}] 🧠 Calling OpenAI to generate response...")
                     
                     # Send an artifact to show "thinking"
-                    event_bus.publish({
-                        "kind": "artifact-update",
-                        "taskId": task_id,
-                        "contextId": context_id,
-                        "artifact": {
-                            "artifactId": f"thought-{int(datetime.utcnow().timestamp())}",
-                            "name": "Thought Process",
-                            "parts": [{"kind": "text", "text": "Analyzing your request..."}]
-                        }
-                    })
+                    await event_bus.enqueue_event(
+                        TaskArtifactUpdateEvent(
+                            kind="artifact-update",
+                            taskId=task_id,
+                            contextId=context_id,
+                            artifact=Artifact(
+                                artifactId=f"thought-{int(datetime.now(timezone.utc).timestamp())}",
+                                name="Thought Process",
+                                parts=[Part(root=TextPart(text="Analyzing your request..."))],
+                            ),
+                        )
+                    )
 
                     response = await openai_client.chat.completions.create(
                         model="gpt-4-turbo",
@@ -131,7 +147,7 @@ class Executor(AgentExecutor):
                     )
                     
                     if task_id in self.cancelled_tasks:
-                        return self._handle_cancelled(task_id, context_id, event_bus)
+                        return await self._handle_cancelled(task_id, context_id, event_bus)
                         
                     response_text = response.choices[0].message.content
                     
@@ -143,73 +159,83 @@ class Executor(AgentExecutor):
                 print(f"[{task_id}] 🤖 Generating fallback response (simulating work)...")
                 for _ in range(10): # 1 second delay split into checks
                     if task_id in self.cancelled_tasks:
-                        return self._handle_cancelled(task_id, context_id, event_bus)
+                        return await self._handle_cancelled(task_id, context_id, event_bus)
                     await asyncio.sleep(0.1)
                     
                 response_text = self._generate_fallback_response(user_text)
 
             if task_id in self.cancelled_tasks:
-                return self._handle_cancelled(task_id, context_id, event_bus)
+                return await self._handle_cancelled(task_id, context_id, event_bus)
 
             # 3. Publish Final Response
-            response_message = {
-                "kind": "message",
-                "messageId": str(uuid.uuid4()),
-                "role": "agent",
-                "parts": [{"kind": "text", "text": response_text or ""}],
-                "contextId": context_id,
-            }
-            event_bus.publish(response_message)
+            response_message = Message(
+                kind="message",
+                messageId=str(uuid.uuid4()),
+                role="agent",
+                parts=[Part(root=TextPart(text=response_text or ""))],
+                contextId=context_id,
+            )
+            await event_bus.enqueue_event(response_message)
 
             # 4. Mark Task as Completed
-            completed_update = {
-                "kind": "status-update",
-                "taskId": task_id,
-                "contextId": context_id,
-                "status": {"state": "completed", "timestamp": datetime.utcnow().isoformat() + "Z"},
-                "final": True,
-            }
-            event_bus.publish(completed_update)
+            completed_update = TaskStatusUpdateEvent(
+                kind="status-update",
+                taskId=task_id,
+                contextId=context_id,
+                status=TaskStatus(
+                    state=TaskState.completed,
+                    timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                ),
+                final=True,
+            )
+            await event_bus.enqueue_event(completed_update)
             print(f"[{task_id}] 📤 Response sent and task completed.")
 
         except Exception as e:
             print(f"[{task_id}] 💥 Error during execution: {e}")
-            error_message = {
-                "kind": "message",
-                "messageId": str(uuid.uuid4()),
-                "role": "agent",
-                "parts": [
-                    {
-                        "kind": "text",
-                        "text": f"I encountered an error processing your request: {e}",
-                    }
+            error_message = Message(
+                kind="message",
+                messageId=str(uuid.uuid4()),
+                role="agent",
+                parts=[
+                    Part(root=TextPart(text=f"I encountered an error processing your request: {e}"))
                 ],
-                "contextId": context_id,
-            }
-            event_bus.publish(error_message)
+                contextId=context_id,
+            )
+            await event_bus.enqueue_event(error_message)
             # Mark as failed
-            event_bus.publish({
-                "kind": "status-update",
-                "taskId": task_id,
-                "contextId": context_id,
-                "status": {"state": "failed", "timestamp": datetime.utcnow().isoformat() + "Z"},
-                "final": True,
-            })
+            await event_bus.enqueue_event(
+                TaskStatusUpdateEvent(
+                    kind="status-update",
+                    taskId=task_id,
+                    contextId=context_id,
+                    status=TaskStatus(
+                        state=TaskState.failed,
+                        timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                    ),
+                    final=True,
+                )
+            )
         finally:
             # Clean up cancellation set
             if task_id in self.cancelled_tasks:
                 self.cancelled_tasks.remove(task_id)
-            event_bus.finished()
+            await event_bus.close()
 
-    def _handle_cancelled(self, task_id, context_id, event_bus):
+    async def _handle_cancelled(self, task_id, context_id, event_bus):
         print(f"[{task_id}] 🛑 Execution aborted due to cancellation.")
-        event_bus.publish({
-            "kind": "status-update",
-            "taskId": task_id,
-            "contextId": context_id,
-            "status": {"state": "canceled", "timestamp": datetime.utcnow().isoformat() + "Z"},
-            "final": True,
-        })
+        await event_bus.enqueue_event(
+            TaskStatusUpdateEvent(
+                kind="status-update",
+                taskId=task_id,
+                contextId=context_id,
+                status=TaskStatus(
+                    state=TaskState.canceled,
+                    timestamp=datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                ),
+                final=True,
+            )
+        )
         return
 
     def _generate_fallback_response(self, user_text: str) -> str:
@@ -222,7 +248,7 @@ class Executor(AgentExecutor):
             return "I am an A2A-compliant AI agent. Try asking me questions!"
         return f'You said: "{user_text}". I am in simple mode. Configure OPENAI_API_KEY for AI responses.'
 
-    async def cancel_task(self, task_id: str, event_bus):
+    async def cancel(self, task_id: str, event_bus):
         print(f"[{task_id}] 🛑 Task cancellation requested")
         self.cancelled_tasks.add(task_id)
         # Note: The execute loop picks up this flag. 
@@ -240,7 +266,7 @@ request_handler = DefaultRequestHandler(
     task_store=task_store, agent_executor=agent_executor
 )
 app_builder = A2AFastAPIApplication(agent_card=agent_card, http_handler=request_handler)
-app_builder.add_routes_to_app(app, agent_card_url=str(".agent-card.json"))
+app_builder.add_routes_to_app(app, agent_card_url="/.well-known/agent-card.json")
 
 if __name__ == "__main__":
     port_str = os.environ.get("PORT")
